@@ -1,0 +1,4 @@
+target/
+.dioxus/
+dist/
+*.apk

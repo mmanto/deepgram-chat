@@ -1,0 +1,32 @@
+[package]
+name = "deepgram-chat"
+version = "0.1.0"
+edition = "2021"
+description = "Chat estilo WhatsApp para comunicarse con las APIs de Deepgram (STT/TTS) y con el Deepgram Voice Agent por WebSocket"
+
+[dependencies]
+dioxus = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# --- Módulo agente (WebSocket) ---
+futures-util = "0.3"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+# Fuerza el proveedor TLS `ring` (más fiable con el NDK de Android que aws-lc-rs).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[features]
+# `dx` detecta la plataforma por estas features: con `default` puedes ejecutar
+# `dx serve` sin `--platform` (escritorio en Linux/macOS/Windows) y `cargo run`
+# arranca directamente. Al pasar `--platform android` dx descarta `default` y
+# habilita `dioxus/mobile`.
+default = ["desktop"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]

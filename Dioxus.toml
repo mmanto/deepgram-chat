@@ -1,0 +1,33 @@
+[application]
+name = "Deepgram Chat"
+
+# `dx` reescribe el MainActivity.kt generado en cada build; con esta clave se
+# usa el nuestro, que aplica los insets del sistema (barra de estado, de
+# navegación y teclado) como padding al WebView. Sin él, con targetSdk 35 la
+# cabecera y la barra de escritura quedan debajo de los menús del sistema.
+android_main_activity = "android/MainActivity.kt"
+
+[web.app]
+title = "Deepgram Chat"
+
+[bundle]
+identifier = "com.tuusuario.deepgramchat"
+
+[android]
+min_sdk = 24
+target_sdk = 35
+compile_sdk = 35
+
+# `dx` inyecta estos permisos en el AndroidManifest.xml generado (que se
+# reescribe en cada build): sin RECORD_AUDIO el WebView no puede usar el
+# micrófono y el modo agente 🤖 no funciona.
+[permissions.microphone]
+description = "Hablar con el agente de voz de Deepgram"
+
+# `RustWebChromeClient.onPermissionRequest` (generado por `dx`) pide
+# `[MODIFY_AUDIO_SETTINGS, RECORD_AUDIO]` y solo llama a `request.grant()` si
+# TODOS vienen concedidos. Un permiso que no está en el manifest se resuelve
+# como `false` sin diálogo, así que sin esta declaración getUserMedia falla
+# aunque el usuario acepte el diálogo del micrófono.
+[android.permissions]
+"android.permission.MODIFY_AUDIO_SETTINGS" = { description = "Grabar audio en las llamadas al WebView" }
