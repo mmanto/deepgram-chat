@@ -20,7 +20,7 @@ compile_sdk = 35
 
 # `dx` inyecta estos permisos en el AndroidManifest.xml generado (que se
 # reescribe en cada build): sin RECORD_AUDIO el WebView no puede usar el
-# micrófono y el modo agente 🤖 no funciona.
+# micrófono y la conversación de voz no funciona.
 [permissions.microphone]
 description = "Hablar con el agente de voz de Deepgram"
 

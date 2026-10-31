@@ -1,13 +1,11 @@
 [package]
 name = "deepgram-chat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Chat estilo WhatsApp para comunicarse con las APIs de Deepgram (STT/TTS) y con el Deepgram Voice Agent por WebSocket"
 
 [dependencies]
 dioxus = "0.7"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -21,6 +19,10 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = [
 ] }
 # Fuerza el proveedor TLS `ring` (más fiable con el NDK de Android que aws-lc-rs).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# --- Cliente HTTP del backend de reclamos ---
+# `rustls-tls` = webpki-roots + proveedor `ring`: código nativo, sin OpenSSL
+# (el NDK de Android no lo trae) y coherente con el TLS del WebSocket.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [features]
 # `dx` detecta la plataforma por estas features: con `default` puedes ejecutar
