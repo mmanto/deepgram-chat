@@ -34,17 +34,18 @@ Diseño de mensajería en **dos paneles** (claro, azul y blanco):
   *pensando…*, *hablando…*, *sin micrófono*), burbujas del usuario a la derecha
   y del agente a la izquierda, píldora de fecha, puntos animados mientras el
   agente piensa y una franja ámbar para los avisos.
-- **Barra inferior:** el micrófono (con pulso cuando está abierto), el estado de
-  la conversación y un botón circular para **interrumpir** la voz del agente
-  (solo se activa mientras habla).
+- **Barra inferior:** el botón del micrófono (apagado por defecto, con pulso
+  cuando está abierto), el estado de la conversación y un botón circular para
+  **interrumpir** la voz del agente (solo se activa mientras habla).
 - **Móvil (< 768 px):** se muestra un panel cada vez; la flecha de la cabecera
   vuelve a la lista.
 
 ## Cómo funciona el modo conversación
 
 La app solo tiene un modo: la conversación en vivo. Al abrirla conecta el agente
-y deja el micrófono abierto; el **VAD del propio agente** cierra cada turno, así
-se habla con naturalidad, como en un diálogo entre personas.
+con el micrófono **apagado**; lo activas con el botón de la barra inferior. Una
+vez abierto, el **VAD del propio agente** cierra cada turno, así se habla con
+naturalidad, como en un diálogo entre personas.
 
 Al arrancar, la app hace `POST /api/public/voice/session` con
 `Authorization: Bearer tk_live_…` (la lee de `.env` o del modal de
@@ -54,16 +55,17 @@ nombre del bot, el saludo y un **ticket de 60 s**, y la app abre
 
 El proxy manda `meta` (identidad), conecta con Deepgram, y reenvía el
 `Settings` que armó el servidor (escucha **nova-3** en español, prompt/tools
-del bot y voz del canal). Al recibir `SettingsApplied` se abre el micrófono
-(antes de eso el agente no acepta audio). El frame `Settings` del cliente se
-ignora: la configuración es del servidor.
+del bot y voz del canal). Al recibir `SettingsApplied` se habilita el botón del
+micrófono (antes de eso el agente no acepta audio); la captura empieza cuando
+lo pulsas. El frame `Settings` del cliente se ignora: la configuración es del
+servidor.
 
-El micrófono se captura en el webview con `getUserMedia` +
-`ScriptProcessorNode` (bloques de 128 ms), **en continuo** y también el
-silencio; `CONV_DRAIN` lo remuestrea a PCM 16 kHz (el dispositivo puede ignorar
-el `sampleRate` pedido) y una bomba lo manda al agente cada 100 ms. No hay VAD
-propio ni silencio añadido: el agente decide el fin de turno al detectar la
-pausa, igual que el starter de FastAPI que funciona.
+Mientras el botón está activo, el micrófono se captura en el webview con
+`getUserMedia` + `ScriptProcessorNode` (bloques de 128 ms), **en continuo** y
+también el silencio; `CONV_DRAIN` lo remuestrea a PCM 16 kHz (el dispositivo
+puede ignorar el `sampleRate` pedido) y una bomba lo manda al agente cada
+100 ms. No hay VAD propio ni silencio añadido: el agente decide el fin de turno
+al detectar la pausa, igual que el starter de FastAPI que funciona.
 
 La voz del agente llega en tramas binarias PCM de 24 kHz y se reproduce **en
 streaming**: cada trama se programa en el reloj del `AudioContext`
@@ -91,7 +93,7 @@ El backend/proxy responde con:
 - `Error` / `Warning` → se registran en el log (stderr/logcat), no en el chat.
 
 Si la conexión se cae, la app reconecta sola y lo registra en el log (el chat
-queda limpio: solo el diálogo); el micrófono sigue abierto y el audio se
+queda limpio: solo el diálogo); el micrófono conserva su estado y el audio se
 descarta mientras no hay agente.
 
 > La arquitectura es productor/consumidor: la tarea de tokio posee el socket y
@@ -238,12 +240,12 @@ modal ⚙️ y guarda la key en `localStorage`.
    sola vez (`POST /api/admin/tenants/{id}/api-key`). Con ella la app resuelve
    el tenant y su canal de voz. Una key inválida, revocada o de un tenant
    suspendido devuelve `401` y se muestra en la franja de aviso.
-3. **Conversación:** la app pide el ticket, conecta el proxy, abre el micrófono
-   al recibir `SettingsApplied` y deja que el VAD del agente cierre cada turno,
-   así se habla sin tocar nada. El subtítulo muestra «te escucho…»,
-   «pensando…» o «hablando…» y la barra indica el estado; puedes interrumpir al
-   agente hablando encima. La voz se oye en streaming; en el historial local
-   solo quedan los textos transcritos.
+3. **Conversación:** la app pide el ticket, conecta el proxy y habilita el
+   botón del micrófono al recibir `SettingsApplied`; pulsa el micrófono para
+   hablar. Una vez activo, deja que el VAD del agente cierre cada turno. El
+   subtítulo muestra «te escucho…», «pensando…» o «hablando…» y la barra
+   indica el estado; puedes interrumpir al agente hablando encima. La voz se
+   oye en streaming; en el historial local solo quedan los textos transcritos.
 
 ### Identidad y herramientas
 
@@ -322,8 +324,8 @@ curl -s http://127.0.0.1:9222/json   # → webSocketDebuggerUrl → Runtime.eval
   fiable al compilar para el NDK de Android que `aws-lc-rs`.
 - **Protocolo del proxy:** la app **no** envía `Settings` ni conoce el de
   Deepgram. El proxy manda `meta` (identidad), reenvía el `Settings` que armó
-  el servidor y `SettingsApplied` habilita el micrófono. Los textos llegan como
-  `ConversationText` con `role` (`user`/`assistant`). Los frames
+  el servidor y `SettingsApplied` habilita el botón del micrófono. Los textos
+  llegan como `ConversationText` con `role` (`user`/`assistant`). Los frames
   `Settings`/`UpdateThink`/`UpdatePrompt`/`UpdateSpeak` del cliente se ignoran.
   El contrato de Deepgram vive en `gestion.ar`
   (`app/services/voice_session_service.py`, ADR-034).

@@ -258,6 +258,22 @@ for (let i = 0; i < bytes.length; i += 32768) {
 return btoa(bin);
 "#;
 
+/// Cierra el micrófono: corta la captura y libera el stream y el AudioContext.
+/// El botón de la barra inferior lo usa al desactivar el micrófono.
+const CONV_STOP: &str = r#"
+try {
+  const mic = window.dgMic;
+  if (!mic) return "ok";
+  window.dgMic = null;
+  try { mic.proc.disconnect(); } catch (_) {}
+  try { mic.entrada.disconnect(); } catch (_) {}
+  try { mic.mudo.disconnect(); } catch (_) {}
+  try { mic.stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+  try { if (mic.ctx.state !== "closed") mic.ctx.close(); } catch (_) {}
+  return "ok";
+} catch (err) { return "error: " + err; }
+"#;
+
 /// Iniciales del nombre del bot para el avatar ("Municipio de Bolívar" → "MB").
 fn initials(name: &str) -> String {
     let mut letras: Vec<char> = name
@@ -380,12 +396,16 @@ fn App() -> Element {
     let mut agente = use_signal(|| None::<agent::Agente>);
     // True mientras el bootstrap HTTP o `agent::conectar` están en curso.
     let mut conectando = use_signal(|| false);
-    // La app solo tiene modo conversación: el micrófono queda abierto y el VAD
-    // del agente cierra cada turno; `dialogo` indica que el micro está activo.
+    // La app solo tiene modo conversación: el micrófono se activa con el botón
+    // de la barra inferior y el VAD del agente cierra cada turno; `dialogo`
+    // indica que el micro está capturando.
     let mut dialogo = use_signal(|| false);
     // El permiso de micrófono falló: sin audio el agente acaba cerrando el
     // socket, así que no se reconecta en bucle (se reintenta al Guardar).
     let mut sin_mic = use_signal(|| false);
+    // El agente aceptó audio (SettingsApplied): el botón del micrófono se
+    // habilita. Hasta entonces queda deshabilitado y con el icono tachado.
+    let mut listo = use_signal(|| false);
     // Estados del turno en curso (solo para el subtítulo y la barra).
     let mut escuchando = use_signal(|| false);
     let mut hablando = use_signal(|| false);
@@ -421,6 +441,7 @@ fn App() -> Element {
         }
         let session = *generation.read();
         conectando.set(true);
+        listo.set(false);
         aviso.set(String::new());
         eprintln!("[deepgram-chat] intento de sesión");
         spawn(async move {
@@ -531,8 +552,8 @@ fn App() -> Element {
         }
     });
 
-    // Abre el micrófono (una sola vez) y deja que el VAD del agente cierre los
-    // turnos. Si falla el permiso, se registra y `dialogo` vuelve a false.
+    // Abre el micrófono cuando el usuario lo pide con el botón de la barra
+    // inferior. Si falla el permiso, se registra y `dialogo` vuelve a false.
     let open_mic: Callback<(), ()> = Callback::new(move |_| {
         if *dialogo.read() {
             return;
@@ -549,6 +570,22 @@ fn App() -> Element {
                     );
                 }
             }
+        });
+    });
+
+    // Cierra el micrófono cuando el usuario lo apaga. `CONV_STOP` corta el
+    // stream y libera el AudioContext; al volver `dialogo` a false la bomba
+    // deja de drenar audio.
+    let close_mic: Callback<(), ()> = Callback::new(move |_| {
+        if !*dialogo.read() {
+            return;
+        }
+        spawn(async move {
+            match dioxus::document::eval(CONV_STOP).await {
+                Ok(v) if v.as_str() == Some("ok") => {}
+                _ => eprintln!("[deepgram-chat] error: no se pudo cerrar el micrófono"),
+            }
+            dialogo.set(false);
         });
     });
 
@@ -593,7 +630,6 @@ fn App() -> Element {
             let mut audio: Vec<u8> = Vec::new();
             let mut stop_voice = false;
             let mut reactivate_voice = false;
-            let mut reopen_mic = false;
             let mut reconnect = false;
             loop {
                 let ev = {
@@ -619,9 +655,11 @@ fn App() -> Element {
                     agent::AgentEvent::Listo => {
                         pensando.set(false);
                         aviso.set(String::new());
-                        // Sesión real con el agente: el backoff vuelve a cero.
+                        // Sesión real con el agente: el backoff vuelve a cero y
+                        // el botón del micrófono se habilita. El micro no se
+                        // abre solo: el usuario pulsa el botón.
                         intentos.set(0);
-                        reopen_mic = true;
+                        listo.set(true);
                         reactivate_voice = true;
                     }
                     agent::AgentEvent::UsuarioHablo => {
@@ -668,6 +706,7 @@ fn App() -> Element {
                     }
                     agent::AgentEvent::Cerrado => {
                         agente.set(None);
+                        listo.set(false);
                         escuchando.set(false);
                         hablando.set(false);
                         pensando.set(false);
@@ -691,9 +730,6 @@ fn App() -> Element {
                 if let Err(e) = dioxus::document::eval(&reproducir_pcm(&audio)).await {
                     eprintln!("[deepgram-chat] error: no se pudo reproducir audio: {e}");
                 }
-            }
-            if reopen_mic {
-                open_mic.call(());
             }
             if reconnect {
                 if *sin_mic.read() {
@@ -776,10 +812,12 @@ fn App() -> Element {
         "hablando…".to_string()
     } else if *sin_mic.read() {
         "sin micrófono".to_string()
-    } else if en_linea {
-        "en línea".to_string()
-    } else {
+    } else if !*listo.read() {
         "conectando…".to_string()
+    } else if !*dialogo.read() {
+        "micrófono apagado".to_string()
+    } else {
+        "en línea".to_string()
     };
     let estado_barra = if *escuchando.read() {
         "🔴 Te escucho… puedes hablar con naturalidad"
@@ -791,6 +829,10 @@ fn App() -> Element {
         "🎤 Sin micrófono — revisa el permiso y pulsa Guardar"
     } else if agente.read().is_none() {
         "🎧 Conectando el agente…"
+    } else if !*listo.read() {
+        "🎧 Preparando la conversación…"
+    } else if !*dialogo.read() {
+        "🎤 Micrófono apagado — pulsa el micrófono para hablar"
     } else {
         "🎧 Conversación activa — habla cuando quieras"
     };
@@ -1022,14 +1064,33 @@ fn App() -> Element {
                 // (el VAD del agente cierra cada turno al detectar la pausa).
                 div { class: "composer",
                     div { class: "composer-row",
-                        div {
+                        button {
                             class: if *dialogo.read() && !*sin_mic.read() { "mic-punto activo" } else { "mic-punto" },
-                            title: "Micrófono abierto",
+                            disabled: !*dialogo.read() && (!*listo.read() || *sin_mic.read()),
+                            title: if *dialogo.read() {
+                                "Desactivar micrófono"
+                            } else if *sin_mic.read() {
+                                "Sin micrófono — revisa el permiso en ⚙️"
+                            } else if !*listo.read() {
+                                "Esperando al agente…"
+                            } else {
+                                "Activar micrófono"
+                            },
+                            onclick: move |_| {
+                                if *dialogo.read() {
+                                    close_mic.call(());
+                                } else {
+                                    open_mic.call(());
+                                }
+                            },
                             svg {
                                 view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2",
                                 path { d: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" }
                                 path { d: "M19 10v2a7 7 0 0 1-14 0v-2" }
                                 path { stroke_linecap: "round", d: "M12 19v3" }
+                                if !*dialogo.read() {
+                                    path { stroke_linecap: "round", d: "M4 4l16 16" }
+                                }
                             }
                         }
                         div { class: "estado-pill", "{estado_barra}" }
@@ -1111,17 +1172,19 @@ fn App() -> Element {
 const CSS: &str = r#"
 * { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
-  --bg: #F0F7FE;
+  --bg: #F4F0FA;
   --surface: #FFFFFF;
-  --line: #D6E8F9;
-  --line-soft: #E3F0FC;
+  --line: #E4DCF2;
+  --line-soft: #EFEAF7;
   --ink: #0F3D6B;
   --muted: #4A7BA8;
   --hint: #6FB1F1;
   --accent: #4A9AE0;
   --accent-strong: #2D7BC4;
-  --accent-soft: #E3F0FC;
-  --accent-softer: #B8D8F7;
+  --accent-soft: #EDE7F6;
+  --accent-softer: #DCD1EE;
+  /* Color de referencia del micrófono. */
+  --mic-ref: #2a1649;
   --own: #1B5A94;
   --online: #34D399;
   --warn-ink: #B45309;
@@ -1226,9 +1289,12 @@ input, select { font: inherit; }
 
 .composer { flex-shrink: 0; padding: 14px 24px; background: var(--surface); border-top: 1px solid var(--line); }
 .composer-row { display: flex; align-items: center; gap: 10px; }
-.mic-punto { position: relative; display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; flex-shrink: 0; border-radius: 50%; background: var(--accent-soft); color: var(--accent-strong); }
+.mic-punto { position: relative; display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; flex-shrink: 0; padding: 0; border: none; border-radius: 50%; background: var(--accent-soft); color: var(--mic-ref); cursor: pointer; transition: background .2s, color .2s, opacity .2s; }
 .mic-punto svg { width: 18px; height: 18px; }
-.mic-punto.activo::after { content: ""; position: absolute; inset: -3px; border: 2px solid rgba(74, 154, 224, .35); border-radius: 50%; animation: latido 2s infinite; }
+.mic-punto:disabled { cursor: default; opacity: .5; }
+.mic-punto:not(:disabled):hover { background: var(--mic-ref); color: #FFFFFF; }
+.mic-punto.activo { background: var(--mic-ref); color: #FFFFFF; }
+.mic-punto.activo::after { content: ""; position: absolute; inset: -3px; border: 2px solid rgba(42, 22, 73, .35); border-radius: 50%; animation: latido 2s infinite; }
 @keyframes latido { 0% { transform: scale(.92); opacity: .9; } 70%, 100% { transform: scale(1.18); opacity: 0; } }
 .estado-pill { display: flex; align-items: center; flex: 1; min-width: 0; min-height: 42px; padding: 10px 16px; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; font-size: 13px; color: var(--muted); }
 .btn-redondo { display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; flex-shrink: 0; border-radius: 50%; background: var(--accent-soft); color: var(--accent-softer); cursor: default; transition: background .2s, color .2s, box-shadow .2s; }
