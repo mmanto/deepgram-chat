@@ -34,17 +34,26 @@ Diseño de mensajería en **dos paneles** (claro, azul y blanco):
   *pensando…*, *hablando…*, *sin micrófono*), burbujas del usuario a la derecha
   y del agente a la izquierda, píldora de fecha, puntos animados mientras el
   agente piensa y una franja ámbar para los avisos.
-- **Barra inferior:** el botón del micrófono (apagado por defecto, con pulso
-  cuando está abierto), el estado de la conversación y un botón circular para
-  **interrumpir** la voz del agente (solo se activa mientras habla).
+- **Selector Voz | Texto** en la cabecera del chat (visible también en móvil):
+  elige el transporte (WebSocket de Deepgram o `POST /api/public/voice/text`).
+  Cambiar de modo cierra la sesión del otro modo y abre la del elegido; el
+  historial no se toca (lo reanuda el backend por `device_id`). La elección se
+  guarda en `localStorage` (`modo_interaccion`).
+- **Barra inferior (modo Voz):** el botón del micrófono (apagado por defecto,
+  con pulso cuando está abierto), el estado de la conversación y un botón
+  circular para **interrumpir** la voz del agente (solo se activa mientras
+  habla).
+- **Composer (modo Texto):** campo de texto y botón de enviar en lugar del
+  micrófono; el mensaje se envía con `Enter` o con el botón.
 - **Móvil (< 768 px):** se muestra un panel cada vez; la flecha de la cabecera
   vuelve a la lista.
 
-## Cómo funciona el modo conversación
+## Cómo funciona la conversación
 
-La app solo tiene un modo: la conversación en vivo. Al abrirla conecta el agente
-con el micrófono **apagado**; lo activas con el botón de la barra inferior. Una
-vez abierto, el **VAD del propio agente** cierra cada turno, así se habla con
+La app tiene dos modos sobre la **misma** sesión del proxy: **Texto** (por
+defecto, no pide micrófono) y **Voz**. Al abrirla conecta el agente sin abrir el
+micrófono; en modo Voz lo activas con el botón de la barra inferior. Una vez
+abierto, el **VAD del propio agente** cierra cada turno, así se habla con
 naturalidad, como en un diálogo entre personas.
 
 Al arrancar, la app hace `POST /api/public/voice/session` con
@@ -80,11 +89,32 @@ encima del agente y él deja de sonar. `getUserMedia` usa `echoCancellation`,
 `noiseSuppression` y `autoGainControl` para que la voz del altavoz no vuelva por
 el micrófono.
 
+### Modo Texto (sin Deepgram)
+
+En modo **Texto** el cliente **no abre el WebSocket**: cada mensaje va a
+`POST /api/public/voice/text` con la API key del tenant y el `device_id`
+(módulo `src/texto.rs`). El backend corre el mismo agente del bot (prompt,
+tools, RAG e historial) con `AgentService.run_turn`, sin STT, sin TTS y sin
+minutos de agente; responde la respuesta completa en JSON (ADR-040 de
+gestion.ar). Por eso:
+
+- se **ahorra** la sesión de Deepgram y no hay audio que descartar;
+- funciona con el permiso de micrófono denegado o sin dispositivo de audio;
+- la burbuja del usuario se pinta de forma local (el endpoint devuelve sólo la
+  respuesta) y el texto del agente cuando llega el JSON.
+
+Al pasar a Texto se apaga el micrófono si estaba abierto, se corta la voz
+programada (`window.dgAudioStop`) y se cierra el socket del agente; al volver a
+Voz se pide un ticket nuevo. El modo se guarda en `localStorage`
+(`modo_interaccion` = `"voz"` | `"texto"`) y se restaura al arrancar (por
+defecto, Texto).
+
 El backend/proxy responde con:
 
 - `meta` → nombre del bot y del tenant (y saludo), para la cabecera.
-- `ConversationText` (`role: "user"`) → tu mensaje transcrito (burbuja con el
-  icono de micrófono en su metadato).
+- `ConversationText` (`role: "user"`) → tu mensaje transcrito del micrófono
+  (la burbuja lleva el icono de micrófono; en modo Texto el turno no pasa por
+  este socket).
 - `ConversationText` (`role: "assistant"`) → respuesta del LLM (burbuja del agente).
 - Tramas binarias → la voz del agente (24 kHz), reproducida en streaming;
   no queda en el historial.
@@ -246,6 +276,9 @@ modal ⚙️ y guarda la key en `localStorage`.
    subtítulo muestra «te escucho…», «pensando…» o «hablando…» y la barra
    indica el estado; puedes interrumpir al agente hablando encima. La voz se
    oye en streaming; en el historial local solo quedan los textos transcritos.
+   Con el selector en **Texto** escribes en el composer y no se reproduce
+   audio ni se abre el socket de voz (el turno va por HTTP); el modo se
+   recuerda entre arranques y por defecto es Texto.
 
 ### Identidad y herramientas
 

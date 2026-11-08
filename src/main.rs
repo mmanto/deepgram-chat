@@ -1,14 +1,25 @@
 mod agent;
 mod config;
+mod texto;
 
 use base64::Engine as _;
 use chrono::Local;
 use dioxus::prelude::*;
 
+/// Modo de interacción elegido por el usuario.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Modo {
+    Voz,
+    Texto,
+}
+
 #[derive(Clone, PartialEq)]
 struct Message {
     id: usize,
     mine: bool,
+    /// El mensaje del usuario vino del micrófono (decide el icono del
+    /// metadato; no cambia al alternar de modo).
+    voz: bool,
     text: String,
     time: String,
 }
@@ -44,6 +55,7 @@ fn push(
     ids: &mut Signal<usize>,
     mine: bool,
     text: String,
+    voz: bool,
 ) {
     let id = *ids.read();
     ids.set(id + 1);
@@ -51,6 +63,7 @@ fn push(
     messages[contact_index].push(Message {
         id,
         mine,
+        voz,
         text,
         time: now(),
     });
@@ -293,7 +306,7 @@ fn initials(name: &str) -> String {
 /// Cadena completa de causas de un error. `Display` de `reqwest::Error` solo
 /// muestra "error sending request for url (…)", que oculta si falló el DNS, el
 /// TCP, el TLS o el runtime de Tokio.
-fn causas(e: &dyn std::error::Error) -> String {
+pub(crate) fn causas(e: &dyn std::error::Error) -> String {
     let mut out = e.to_string();
     let mut fuente = e.source();
     while let Some(causa) = fuente {
@@ -396,10 +409,15 @@ fn App() -> Element {
     let mut agente = use_signal(|| None::<agent::Agente>);
     // True mientras el bootstrap HTTP o `agent::conectar` están en curso.
     let mut conectando = use_signal(|| false);
-    // La app solo tiene modo conversación: el micrófono se activa con el botón
-    // de la barra inferior y el VAD del agente cierra cada turno; `dialogo`
-    // indica que el micro está capturando.
+    // En modo Voz el micrófono se activa con el botón de la barra inferior y
+    // el VAD del agente cierra cada turno; `dialogo` indica que el micro está
+    // capturando.
     let mut dialogo = use_signal(|| false);
+    // Modo de interacción. Se persiste en localStorage ('modo_interaccion') y
+    // por defecto es Texto: arrancar no exige micrófono.
+    let mut modo = use_signal(|| Modo::Texto);
+    // Texto del compositor en modo Texto.
+    let mut borrador = use_signal(String::new);
     // El permiso de micrófono falló: sin audio el agente acaba cerrando el
     // socket, así que no se reconecta en bucle (se reintenta al Guardar).
     let mut sin_mic = use_signal(|| false);
@@ -422,9 +440,9 @@ fn App() -> Element {
     let mut intentos = use_signal(|| 0u32);
     let mut reintento = use_signal(|| (0u64, 0u64));
 
-    // Pide el ticket al backend con la API key del tenant y conecta el proxy.
-    // El micrófono lo abre el evento `Listo` (SettingsApplied): antes de eso
-    // el agente no acepta audio.
+    // Pide la sesión al backend con la API key del tenant. En Voz el ticket
+    // abre el WebSocket del proxy (el micrófono lo habilita `SettingsApplied`);
+    // en Texto sólo se traen la identidad y el saludo, sin abrir socket.
     let start_agent: Callback<(), ()> = Callback::new(move |_| {
         if agente.read().is_some() || *conectando.read() {
             return;
@@ -464,6 +482,15 @@ fn App() -> Element {
                         .filter(|d| !d.is_empty())
                         .unwrap_or(&device);
                     device_id.set(served_device.to_string());
+
+                    if *modo.read() == Modo::Texto {
+                        // Modo Texto: no se abre el WebSocket de voz. El turno
+                        // va por `POST /api/public/voice/text` (sin Deepgram),
+                        // así que sólo hace falta la identidad del bot.
+                        conectando.set(false);
+                        listo.set(true);
+                        return;
+                    }
 
                     let ws_path = value["ws_path"].as_str().unwrap_or_default();
                     let ticket = value["ticket"].as_str().unwrap_or_default();
@@ -515,7 +542,9 @@ fn App() -> Element {
                 while reintento.peek().0 == id && std::time::Instant::now() < vence {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
+                // En modo Texto no hay socket que reintentar.
                 if reintento.peek().0 == id
+                    && *modo.read() == Modo::Voz
                     && agente.read().is_none()
                     && !*conectando.read()
                 {
@@ -542,7 +571,7 @@ fn App() -> Element {
             if estado != "visible" {
                 continue;
             }
-            if agente.read().is_some() || *conectando.read() {
+            if agente.read().is_some() || *conectando.read() || *modo.read() == Modo::Texto {
                 continue;
             }
             intentos.set(0);
@@ -555,6 +584,9 @@ fn App() -> Element {
     // Abre el micrófono cuando el usuario lo pide con el botón de la barra
     // inferior. Si falla el permiso, se registra y `dialogo` vuelve a false.
     let open_mic: Callback<(), ()> = Callback::new(move |_| {
+        if *modo.read() == Modo::Texto {
+            return;
+        }
         if *dialogo.read() {
             return;
         }
@@ -589,6 +621,77 @@ fn App() -> Element {
         });
     });
 
+    // Cambia de modo. La sesión de voz es de un solo modo: en Texto no hay
+    // WebSocket (el turno va por HTTP, sin Deepgram), así que al cambiar se
+    // cierra la sesión actual y se vuelve a pedir — en Voz abre el proxy, en
+    // Texto sólo trae la identidad del bot.
+    let cambiar_modo: Callback<Modo, ()> = Callback::new(move |nuevo: Modo| {
+        if *modo.read() == nuevo {
+            return;
+        }
+        modo.set(nuevo);
+        let valor = if nuevo == Modo::Texto { "texto" } else { "voz" };
+        spawn(async move {
+            let js = format!(
+                "localStorage.setItem('modo_interaccion', {v}); return 'ok';",
+                v = serde_json::to_string(valor).unwrap_or_default(),
+            );
+            let _ = dioxus::document::eval(&js).await;
+        });
+        // Nada de lo que estaba sonando sobrevive al cambio de modo.
+        spawn(async move {
+            let _ = dioxus::document::eval(
+                "if (window.dgAudioStop) window.dgAudioStop(); return 'ok';",
+            )
+            .await;
+        });
+        if nuevo == Modo::Texto && *dialogo.read() {
+            close_mic.call(());
+        }
+        // Soltar el handle cierra el socket del agente (y con él la sesión de
+        // Deepgram en el proxy).
+        let next_generation = *generation.read() + 1;
+        generation.set(next_generation);
+        agente.set(None);
+        conectando.set(false);
+        listo.set(false);
+        escuchando.set(false);
+        hablando.set(false);
+        pensando.set(false);
+        aviso.set(String::new());
+        intentos.set(0);
+        start_agent.call(());
+    });
+
+    // Envía el mensaje escrito. La respuesta llega por HTTP, no por el socket:
+    // la burbuja del usuario se pinta aquí y el texto del agente cuando
+    // responde el backend.
+    let enviar_texto: Callback<(), ()> = Callback::new(move |_| {
+        let mensaje = borrador.read().trim().to_string();
+        if mensaje.is_empty() || !*listo.read() || *pensando.read() {
+            return;
+        }
+        let key = tenant_key.read().trim().to_string();
+        let device = device_id.read().trim().to_string();
+        if key.is_empty() || device.is_empty() {
+            return;
+        }
+        push(&mut histories, 0, &mut ids, true, mensaje.clone(), false);
+        borrador.set(String::new());
+        aviso.set(String::new());
+        pensando.set(true);
+        spawn(async move {
+            match texto::enviar(&config::texto_url(), &key, &device, &mensaje).await {
+                Ok(respuesta) => push(&mut histories, 0, &mut ids, false, respuesta.reply, false),
+                Err(error) => {
+                    aviso.set(truncate(&error, 160));
+                    eprintln!("[deepgram-chat] error del turno de texto: {error}");
+                }
+            }
+            pensando.set(false);
+        });
+    });
+
     // Instala el reproductor en streaming del webview (los `eval` comparten
     // `window`) y carga la key/identidad guardadas en el almacenamiento.
     use_future(move || async move {
@@ -604,7 +707,8 @@ fn App() -> Element {
                     localStorage.setItem('device_id', d);
                 }
                 return d;
-            })()
+            })(),
+            modo: localStorage.getItem('modo_interaccion') ?? 'texto'
         };"#;
         if let Ok(v) = dioxus::document::eval(js).await {
             if let Some(k) = v["key"].as_str() {
@@ -615,8 +719,13 @@ fn App() -> Element {
             if let Some(d) = v["device"].as_str() {
                 device_id.set(d.to_string());
             }
+            // Solo hay que restaurar Voz: sin preferencia guardada, Texto.
+            if v["modo"].as_str() == Some("voz") {
+                modo.set(Modo::Voz);
+            }
         }
-        // Una vez cargada la identidad, arranca el único modo: la conversación.
+        // Una vez cargada la identidad (y el modo) arranca la sesión del modo
+        // elegido: WebSocket de voz o endpoint HTTP de texto.
         start_agent.call(());
     });
 
@@ -639,12 +748,12 @@ fn App() -> Element {
                 let Some(ev) = ev else { break };
                 match ev {
                     agent::AgentEvent::TextoUsuario(t) => {
-                        // La burbuja ya lleva el icono de micrófono en su
-                        // metadato: el prefijo en el texto sobraba.
-                        push(&mut histories, 0, &mut ids, true, t);
+                        // Este socket sólo existe en modo Voz: el mensaje del
+                        // usuario es una transcripción del micrófono.
+                        push(&mut histories, 0, &mut ids, true, t, true);
                     }
                     agent::AgentEvent::TextoAgente(t) => {
-                        push(&mut histories, 0, &mut ids, false, t);
+                        push(&mut histories, 0, &mut ids, false, t, false);
                     }
                     agent::AgentEvent::Audio(pcm) => audio.extend_from_slice(&pcm),
                     agent::AgentEvent::AudioTerminado => {
@@ -732,7 +841,10 @@ fn App() -> Element {
                 }
             }
             if reconnect {
-                if *sin_mic.read() {
+                if *modo.read() == Modo::Texto {
+                    // En modo Texto no hay sesión de voz que reconectar: el
+                    // turno escrito va por HTTP.
+                } else if *sin_mic.read() {
                     // Sin micrófono no hay audio: el agente cerraría siempre por
                     // timeout. Se reintenta cuando el usuario guarde ajustes.
                     eprintln!(
@@ -755,7 +867,7 @@ fn App() -> Element {
     use_future(move || async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if !*dialogo.read() {
+            if !*dialogo.read() || *modo.read() == Modo::Texto {
                 continue;
             }
             let Ok(v) = dioxus::document::eval(CONV_DRAIN).await else {
@@ -801,9 +913,24 @@ fn App() -> Element {
         }
     };
     let total = histories.read()[0].len();
-    let en_linea = agente.read().is_some() && !*sin_mic.read();
+    // Modo Texto: hay sesión mientras el bootstrap resolvió la identidad, sin
+    // socket ni micrófono.
+    let en_texto = *modo.read() == Modo::Texto;
+    let en_linea = if en_texto {
+        *listo.read()
+    } else {
+        agente.read().is_some() && !*sin_mic.read()
+    };
     let estado_chat = if !aviso.read().is_empty() {
         "aviso del agente".to_string()
+    } else if en_texto {
+        if *pensando.read() {
+            "pensando…".to_string()
+        } else if !*listo.read() {
+            "conectando…".to_string()
+        } else {
+            "en línea".to_string()
+        }
     } else if *escuchando.read() {
         "te escucho…".to_string()
     } else if *pensando.read() {
@@ -819,7 +946,15 @@ fn App() -> Element {
     } else {
         "en línea".to_string()
     };
-    let estado_barra = if *escuchando.read() {
+    let estado_barra = if en_texto {
+        if *pensando.read() {
+            "💭 Pensando la respuesta…"
+        } else if !*listo.read() {
+            "💬 Preparando la conversación…"
+        } else {
+            "💬 Escribe un mensaje y pulsa enviar"
+        }
+    } else if *escuchando.read() {
         "🔴 Te escucho… puedes hablar con naturalidad"
     } else if *pensando.read() {
         "💭 Pensando la respuesta…"
@@ -844,7 +979,13 @@ fn App() -> Element {
         preview: last
             .as_ref()
             .map(|message| truncate(&message.text, 34))
-            .unwrap_or_else(|| "Conversación de voz".to_string()),
+            .unwrap_or_else(|| {
+                if en_texto {
+                    "Conversación de texto".to_string()
+                } else {
+                    "Conversación de voz".to_string()
+                }
+            }),
         time: last
             .as_ref()
             .map(|message| message.time.clone())
@@ -973,9 +1114,25 @@ fn App() -> Element {
                         }
                     }
                     div { class: "chat-acciones",
+                        // Selector Voz | Texto: WebSocket de Deepgram o
+                        // `POST /api/public/voice/text`, distinto composer.
+                        div { class: "modo-switch",
+                            button {
+                                class: if *modo.read() == Modo::Voz { "modo-op activo" } else { "modo-op" },
+                                title: "Conversación por voz",
+                                onclick: move |_| cambiar_modo.call(Modo::Voz),
+                                "Voz"
+                            }
+                            button {
+                                class: if *modo.read() == Modo::Texto { "modo-op activo" } else { "modo-op" },
+                                title: "Chat solo texto",
+                                onclick: move |_| cambiar_modo.call(Modo::Texto),
+                                "Texto"
+                            }
+                        }
                         // Solo aparece si el socket se cayó y no hay reconexión
                         // en curso; pulsarlo reintenta la conexión.
-                        if agente.read().is_none() && !*conectando.read() {
+                        if !en_texto && agente.read().is_none() && !*conectando.read() {
                             button {
                                 class: "icon-btn ghost",
                                 title: "Reconectar",
@@ -1011,7 +1168,9 @@ fn App() -> Element {
                         div { class: "vacio",
                             div { class: "avatar", "🎙️" }
                             if query.is_empty() {
-                                h3 { "Habla para empezar" }
+                                h3 {
+                                    if en_texto { "Escribe para empezar" } else { "Habla para empezar" }
+                                }
                                 p { "{contact_desc}" }
                             } else {
                                 h3 { "Sin resultados" }
@@ -1027,7 +1186,7 @@ fn App() -> Element {
                                 }
                                 div { class: "meta",
                                     span { "{m.time}" }
-                                    if m.mine {
+                                    if m.mine && m.voz {
                                         svg {
                                             class: "ico-mic",
                                             view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2",
@@ -1060,61 +1219,93 @@ fn App() -> Element {
                     }
                 }
 
-                // Barra de estado: solo modo conversación, sin campo de texto
-                // (el VAD del agente cierra cada turno al detectar la pausa).
+                // Composer según el modo: en Texto, campo + enviar (sin
+                // micrófono); en Voz, micrófono y píldora de estado (el VAD del
+                // agente cierra cada turno al detectar la pausa).
                 div { class: "composer",
-                    div { class: "composer-row",
-                        button {
-                            class: if *dialogo.read() && !*sin_mic.read() { "mic-punto activo" } else { "mic-punto" },
-                            disabled: !*dialogo.read() && (!*listo.read() || *sin_mic.read()),
-                            title: if *dialogo.read() {
-                                "Desactivar micrófono"
-                            } else if *sin_mic.read() {
-                                "Sin micrófono — revisa el permiso en ⚙️"
-                            } else if !*listo.read() {
-                                "Esperando al agente…"
-                            } else {
-                                "Activar micrófono"
-                            },
-                            onclick: move |_| {
-                                if *dialogo.read() {
-                                    close_mic.call(());
-                                } else {
-                                    open_mic.call(());
-                                }
-                            },
-                            svg {
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2",
-                                path { d: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" }
-                                path { d: "M19 10v2a7 7 0 0 1-14 0v-2" }
-                                path { stroke_linecap: "round", d: "M12 19v3" }
-                                if !*dialogo.read() {
-                                    path { stroke_linecap: "round", d: "M4 4l16 16" }
+                    if en_texto {
+                        div { class: "composer-row texto",
+                            input {
+                                class: "campo-texto",
+                                r#type: "text",
+                                placeholder: if *listo.read() { "Escribe un mensaje…" } else { "Conectando…" },
+                                value: "{borrador}",
+                                disabled: !*listo.read() || *pensando.read(),
+                                oninput: move |e| borrador.set(e.value()),
+                                onkeydown: move |e| {
+                                    if e.key() == Key::Enter {
+                                        enviar_texto.call(());
+                                    }
+                                },
+                            }
+                            button {
+                                class: "btn-enviar",
+                                title: "Enviar mensaje",
+                                disabled: !*listo.read()
+                                    || *pensando.read()
+                                    || borrador.read().trim().is_empty(),
+                                onclick: move |_| enviar_texto.call(()),
+                                svg {
+                                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2",
+                                    path { stroke_linecap: "round", stroke_linejoin: "round", d: "M22 2L11 13" }
+                                    path { stroke_linecap: "round", stroke_linejoin: "round", d: "M22 2l-7 20-4-9-9-4 20-7z" }
                                 }
                             }
                         }
-                        div { class: "estado-pill", "{estado_barra}" }
-                        button {
-                            class: if *hablando.read() { "btn-redondo listo" } else { "btn-redondo" },
-                            disabled: !*hablando.read(),
-                            title: "Interrumpir al agente",
-                            onclick: move |_| {
-                                // Barge-in explícito: corta la voz ya
-                                // programada y silencia lo que reste del turno.
-                                spawn(async move {
-                                    let _ = dioxus::document::eval(
-                                        "window.dgAudioSilenciar(true); return 'ok';",
-                                    )
-                                    .await;
-                                });
-                                hablando.set(false);
-                                pensando.set(false);
-                            },
-                            svg {
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2",
-                                path { d: "M11 5L6 9H2v6h4l5 4V5z" }
-                                path { stroke_linecap: "round", d: "M22 9l-6 6" }
-                                path { stroke_linecap: "round", d: "M16 9l6 6" }
+                    } else {
+                        div { class: "composer-row",
+                            button {
+                                class: if *dialogo.read() && !*sin_mic.read() { "mic-punto activo" } else { "mic-punto" },
+                                disabled: !*dialogo.read() && (!*listo.read() || *sin_mic.read()),
+                                title: if *dialogo.read() {
+                                    "Desactivar micrófono"
+                                } else if *sin_mic.read() {
+                                    "Sin micrófono — revisa el permiso en ⚙️"
+                                } else if !*listo.read() {
+                                    "Esperando al agente…"
+                                } else {
+                                    "Activar micrófono"
+                                },
+                                onclick: move |_| {
+                                    if *dialogo.read() {
+                                        close_mic.call(());
+                                    } else {
+                                        open_mic.call(());
+                                    }
+                                },
+                                svg {
+                                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2",
+                                    path { d: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" }
+                                    path { d: "M19 10v2a7 7 0 0 1-14 0v-2" }
+                                    path { stroke_linecap: "round", d: "M12 19v3" }
+                                    if !*dialogo.read() {
+                                        path { stroke_linecap: "round", d: "M4 4l16 16" }
+                                    }
+                                }
+                            }
+                            div { class: "estado-pill", "{estado_barra}" }
+                            button {
+                                class: if *hablando.read() { "btn-redondo listo" } else { "btn-redondo" },
+                                disabled: !*hablando.read(),
+                                title: "Interrumpir al agente",
+                                onclick: move |_| {
+                                    // Barge-in explícito: corta la voz ya
+                                    // programada y silencia lo que reste del turno.
+                                    spawn(async move {
+                                        let _ = dioxus::document::eval(
+                                            "window.dgAudioSilenciar(true); return 'ok';",
+                                        )
+                                        .await;
+                                    });
+                                    hablando.set(false);
+                                    pensando.set(false);
+                                },
+                                svg {
+                                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2",
+                                    path { d: "M11 5L6 9H2v6h4l5 4V5z" }
+                                    path { stroke_linecap: "round", d: "M22 9l-6 6" }
+                                    path { stroke_linecap: "round", d: "M16 9l6 6" }
+                                }
                             }
                         }
                     }
@@ -1256,6 +1447,9 @@ input, select { font: inherit; }
 .chat-nombre { overflow: hidden; font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .chat-estado { margin-top: 1px; font-size: 12px; color: var(--hint); }
 .chat-acciones { display: flex; align-items: center; gap: 4px; }
+.modo-switch { display: flex; align-items: center; gap: 2px; padding: 2px; background: var(--accent-soft); border-radius: 999px; }
+.modo-op { padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; color: var(--accent-strong); transition: background .2s, color .2s; }
+.modo-op.activo { background: var(--accent); color: #FFFFFF; }
 .solo-movil { display: none; }
 
 .mensajes { display: flex; flex: 1; flex-direction: column; gap: 10px; min-height: 0; padding: 16px 24px; overflow-y: auto; }
@@ -1301,6 +1495,12 @@ input, select { font: inherit; }
 .btn-redondo svg { width: 18px; height: 18px; }
 .btn-redondo.listo { background: var(--accent); color: #FFFFFF; box-shadow: 0 4px 12px rgba(111, 177, 241, .4); cursor: pointer; }
 .btn-redondo.listo:hover { background: var(--accent-strong); }
+.campo-texto { flex: 1; min-width: 0; min-height: 42px; padding: 10px 16px; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; font-size: 13px; color: var(--ink); outline: none; transition: border-color .2s, box-shadow .2s; }
+.campo-texto::placeholder { color: rgba(111, 177, 241, .65); }
+.campo-texto:focus { border-color: var(--hint); box-shadow: 0 0 0 3px rgba(111, 177, 241, .25); }
+.btn-enviar { display: flex; align-items: center; justify-content: center; width: 42px; height: 42px; flex-shrink: 0; border-radius: 50%; background: var(--accent); color: #FFFFFF; transition: background .2s, color .2s; }
+.btn-enviar:disabled { background: var(--accent-soft); color: var(--accent-softer); cursor: default; }
+.btn-enviar svg { width: 18px; height: 18px; }
 
 /* --- Modal de ajustes --- */
 .modal { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(15, 61, 107, .38); }
@@ -1329,6 +1529,9 @@ select.campo { appearance: auto; }
   .aviso { margin: 0 12px 8px; }
   .burbuja-wrap, .fila.mia .burbuja-wrap { max-width: 82%; }
   .estado-pill { padding: 10px 12px; font-size: 12px; }
+  .modo-switch { flex-shrink: 0; }
+  .modo-op { padding: 4px 8px; font-size: 11px; }
+  .chat-acciones { gap: 2px; }
   .modal { padding: 12px; }
 }
 "#;

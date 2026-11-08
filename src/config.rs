@@ -36,6 +36,12 @@ pub fn session_url() -> String {
     format!("{}/api/public/voice/session", backend_url())
 }
 
+/// `POST /api/public/voice/text` — turno escrito del canal de voz (modo Texto).
+/// Corre el mismo agente sin abrir sesión de Deepgram (ADR-040).
+pub fn texto_url() -> String {
+    format!("{}/api/public/voice/text", backend_url())
+}
+
 /// URL del WebSocket del proxy a partir del `ws_path` que devolvió el backend.
 pub fn ws_url(ws_path: &str, ticket: &str, device_id: &str) -> String {
     let base = backend_url();

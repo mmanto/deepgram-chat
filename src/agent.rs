@@ -65,6 +65,7 @@ impl Agente {
     pub fn enviar_audio(&self, pcm: Vec<u8>) {
         let _ = self.cmd.send(AgentCommand::Audio(pcm));
     }
+
 }
 
 /// Conecta al proxy con el ticket ya incluido en `url`.
@@ -83,15 +84,15 @@ pub async fn conectar(url: &str) -> Result<Agente, String> {
     let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<AgentCommand>();
 
     tokio::spawn(async move {
-        let mut audio_habilitado = false;
+        // `SettingsApplied` recibido: la sesión con el agente existe y admite
+        // audio. Antes de eso se descarta en vez de romper el socket.
+        let mut sesion_lista = false;
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(AgentCommand::Audio(pcm)) => {
-                            // Antes de `SettingsApplied` el agente aún no acepta
-                            // audio: se descarta en vez de romper el socket.
-                            if audio_habilitado && write.send(Message::binary(pcm)).await.is_err() {
+                            if sesion_lista && write.send(Message::binary(pcm)).await.is_err() {
                                 let _ = ev_tx.send(AgentEvent::Cerrado);
                                 break;
                             }
@@ -111,7 +112,7 @@ pub async fn conectar(url: &str) -> Result<Agente, String> {
                             };
                             match v.get("type").and_then(Value::as_str) {
                                 Some("SettingsApplied") => {
-                                    audio_habilitado = true;
+                                    sesion_lista = true;
                                     let _ = ev_tx.send(AgentEvent::Listo);
                                 }
                                 _ => manejar_json(&v, &ev_tx),
